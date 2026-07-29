@@ -1,0 +1,14 @@
+version: "3.8"
+
+# Minimal local Pulsar broker for the demo. Standalone mode, functions worker
+# and stream storage disabled since we don't need them - keeps startup fast
+# and memory light.
+services:
+  pulsar:
+    image: apachepulsar/pulsar:3.2.2
+    command: bin/pulsar standalone --no-functions-worker --no-stream-storage
+    ports:
+      - "6650:6650"   # binary protocol (client connects here)
+      - "8081:8080"   # admin/http (dashboard has a link to check real backlog stats here)
+    environment:
+      PULSAR_MEM: "-Xms512m -Xmx512m -XX:MaxDirectMemorySize=512m"

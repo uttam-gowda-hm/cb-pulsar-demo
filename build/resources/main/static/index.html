@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Circuit Breaker Demo (Pulsar)</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Arial, sans-serif; background:#111; color:#eee; margin:0; padding:24px; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color:#999; margin-bottom: 24px; font-size: 13px; }
+  .row { display:flex; gap:20px; margin-bottom:24px; flex-wrap: wrap; }
+  .card { background:#1c1c1c; border:1px solid #333; border-radius:8px; padding:16px 20px; flex:1; min-width:320px; }
+  .card h2 { font-size:15px; margin:0 0 12px 0; }
+  .unprotected h2 { color:#e05252; }
+  .protected h2 { color:#4caf7d; }
+  .metric { display:flex; justify-content:space-between; font-size:13px; margin-bottom:6px; color:#ccc; }
+  .metric b { color:#fff; }
+  .bar-wrap { background:#333; border-radius:4px; height:14px; margin: 4px 0 14px 0; overflow:hidden; }
+  .bar { height:100%; transition: width 0.3s ease; }
+  .bar.threads { background:#e05252; }
+  .bar.threads.ok { background:#4caf7d; }
+  .badge { display:inline-block; padding:2px 10px; border-radius:12px; font-size:12px; font-weight:600; }
+  .badge.CLOSED { background:#1e4d33; color:#4caf7d; }
+  .badge.OPEN { background:#4d1e1e; color:#e05252; }
+  .badge.HALF_OPEN { background:#4d3d1e; color:#e0b752; }
+  .warn { color:#e0b752; font-weight:600; }
+  .controls { margin-bottom: 20px; display:flex; gap:8px; flex-wrap: wrap; }
+  button { background:#2a2a2a; color:#eee; border:1px solid #444; border-radius:6px; padding:8px 14px; cursor:pointer; font-size:13px; }
+  button:hover { background:#3a3a3a; }
+  button.danger { border-color:#a33; }
+  button.good { border-color:#3a3; }
+</style>
+</head>
+<body>
+  <h1>Circuit Breaker Demo — real Pulsar broker, sample vendor-timeout incident</h1>
+  <div class="sub">Two real Pulsar consumers, each with their own 5-thread listener pool, fed identical traffic. Left has no protection. Right goes through a circuit breaker + timeout + bulkhead.</div>
+
+  <div class="controls">
+    <button onclick="post('/simulate/start')">▶ Start traffic</button>
+    <button onclick="post('/simulate/stop')">■ Stop traffic</button>
+    <button class="danger" onclick="post('/vendor/toggle?delayMillis=8000&healthy=true')">⚠ Make vendor slow (8s)</button>
+    <button class="danger" onclick="post('/vendor/scenario/karza-outage?on=true')">⚠ Karza-style outage (503/504/timeout mix)</button>
+    <button class="good" onclick="post('/vendor/scenario/karza-outage?on=false'); post('/vendor/toggle?delayMillis=100&healthy=true')">✓ Vendor recovers</button>
+  </div>
+
+  <div class="row">
+    <div class="card unprotected">
+      <h2>Unprotected consumer (baseline)</h2>
+      <div class="metric"><span>Busy listener threads</span><b id="u-busy">-</b></div>
+      <div class="bar-wrap"><div class="bar threads" id="u-bar" style="width:0%"></div></div>
+      <div class="metric"><span>Backlog (approx)</span><b id="u-queue">-</b></div>
+      <div class="metric"><span>Success / Failed</span><b id="u-counts">-</b></div>
+      <div class="metric"><span>Fully blocked for</span><b id="u-blocked">-</b></div>
+      <div id="u-restart-warning" style="display:none" class="warn">⚠ All listener threads blocked long enough that a k8s liveness probe would be failing right now</div>
+    </div>
+
+    <div class="card protected">
+      <h2>Protected consumer (circuit breaker)</h2>
+      <div class="metric"><span>Busy listener threads</span><b id="p-busy">-</b></div>
+      <div class="bar-wrap"><div class="bar threads ok" id="p-bar" style="width:0%"></div></div>
+      <div class="metric"><span>Backlog (approx)</span><b id="p-queue">-</b></div>
+      <div class="metric"><span>Success / Deferred / Failed</span><b id="p-counts">-</b></div>
+      <div class="metric"><span>Breaker state</span><b><span class="badge" id="p-state">-</span></b></div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="card">
+      <h2 style="color:#e0b752">Vendor API failures (observability)</h2>
+      <div class="metric"><span>Total attempts (incl. retries)</span><b id="v-attempts">-</b></div>
+      <div class="metric"><span>Retries triggered</span><b id="v-retries">-</b></div>
+      <div class="metric"><span>503 (fast fail)</span><b id="v-503">-</b></div>
+      <div class="metric"><span>504 (slow gateway timeout)</span><b id="v-504">-</b></div>
+      <div class="metric"><span>Client-side timeout (response_code 0)</span><b id="v-0">-</b></div>
+    </div>
+    <div class="card">
+      <h2 style="color:#e0b752">Circuit breaker events</h2>
+      <div id="v-events" style="font-size:12px; color:#ccc; max-height:160px; overflow-y:auto;"></div>
+    </div>
+  </div>
+
+  <div class="sub">
+    Try it: Start traffic → make vendor slow → watch the left pool saturate and its backlog climb, while the right pool's breaker trips OPEN and negative-acks messages for Pulsar to redeliver later, instead of blocking any thread → then click "vendor recovers" and watch the breaker go HALF_OPEN → CLOSED, and the deferred messages come back around.
+    <br><br>
+    Real backlog straight from Pulsar (bonus, requires the broker admin port):<br>
+    <code>curl -s localhost:8081/admin/v2/persistent/public/default/unprotected-verification-requests/stats | jq '.msgBacklog, .subscriptions."unprotected-sub".unackedMessages'</code>
+  </div>
+
+<script>
+async function post(path) {
+  await fetch(path, { method: 'POST' });
+}
+
+async function refresh() {
+  try {
+    const res = await fetch('/stats');
+    const s = await res.json();
+
+    const u = s.unprotected, p = s.protected;
+
+    document.getElementById('u-busy').innerText = u.busyThreads + ' / ' + u.poolSize;
+    document.getElementById('u-bar').style.width = (u.busyThreads / u.poolSize * 100) + '%';
+    document.getElementById('u-queue').innerText = u.queueBacklog;
+    document.getElementById('u-counts').innerText = u.success + ' / ' + u.failed;
+    document.getElementById('u-blocked').innerText = u.fullyBlockedForSeconds + 's';
+    document.getElementById('u-restart-warning').style.display = u.wouldFailHealthCheck ? 'block' : 'none';
+
+    document.getElementById('p-busy').innerText = p.busyThreads + ' / ' + p.poolSize;
+    document.getElementById('p-bar').style.width = (p.busyThreads / p.poolSize * 100) + '%';
+    document.getElementById('p-queue').innerText = p.queueBacklog;
+    document.getElementById('p-counts').innerText = p.success + ' / ' + p.deferred + ' / ' + p.failed;
+
+    const badge = document.getElementById('p-state');
+    badge.innerText = p.circuitBreakerState;
+    badge.className = 'badge ' + p.circuitBreakerState;
+
+    const v = s.vendorApi;
+    document.getElementById('v-attempts').innerText = v.totalAttempts;
+    document.getElementById('v-retries').innerText = v.retriesTriggered;
+    document.getElementById('v-503').innerText = v.count503;
+    document.getElementById('v-504').innerText = v.count504;
+    document.getElementById('v-0').innerText = v.countClientTimeout;
+
+    document.getElementById('v-events').innerHTML =
+      (s.breakerEvents || []).map(e => '<div>' + e + '</div>').join('') || '<i>no events yet</i>';
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+setInterval(refresh, 500);
+refresh();
+</script>
+</body>
+</html>

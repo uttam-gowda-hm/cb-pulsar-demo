@@ -1,0 +1,21 @@
+server:
+  port: 8082
+
+logging:
+  level:
+    root: INFO
+    org.apache.pulsar: WARN
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      vendorApi:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 50
+        slow-call-duration-threshold: 1s
+        slow-call-rate-threshold: 50
+        wait-duration-in-open-state: 8s
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
